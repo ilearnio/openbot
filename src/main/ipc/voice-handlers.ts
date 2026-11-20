@@ -3,6 +3,7 @@ import type {
   SpeechAudio,
   SpeechModelStatus,
   SpeechSettings,
+  SpeechStreamResult,
   VoiceLiveEvent,
   VoiceLiveSession,
   VoiceModelStatus,
@@ -33,6 +34,7 @@ import type { VoiceSpeechService } from "../voice-speech-service";
 import type { VoiceTranscriptionService } from "../voice-transcription-service";
 import { agentRequest } from "./agent-inputs";
 import { eventPayloadHandler, handler, type IpcGroupHandlers, payloadHandler } from "./define-ipc-group";
+import { onOwnerGone } from "./owner-lifetime";
 import { routeToServer } from "./route-to-server";
 import { OwnedSpeechStreams } from "./speech-streams";
 import {
@@ -111,11 +113,7 @@ export function voiceIpcHandlers({
       return;
     }
     liveSessions.set(owner, new Set([sessionId]));
-    owner.once("destroyed", () => stopLiveSessions(owner));
-    owner.on("render-process-gone", () => stopLiveSessions(owner));
-    owner.on("did-start-navigation", (details) => {
-      if (details.isMainFrame && !details.isSameDocument) stopLiveSessions(owner);
-    });
+    onOwnerGone(owner, () => stopLiveSessions(owner));
   };
   return {
     voice: {
@@ -187,19 +185,24 @@ export function voiceIpcHandlers({
         (input): Promise<SpeechAudio> =>
           runCauseEffect(server.speaks() ? server.speak(input.text) : speech.speak(input)),
       ),
-      speakStream: eventPayloadHandler(parseSpeechStreamInput, async (event, input): Promise<void> => {
+      speakStream: eventPayloadHandler(parseSpeechStreamInput, async (event, input): Promise<SpeechStreamResult> => {
         const owner = event.sender;
         const controller = speechStreams.start(owner, input.streamId);
         const renderer = { isDestroyed: () => owner.isDestroyed(), webContents: owner };
-        const send = (audio: SpeechAudio) =>
-          sendToRenderer(renderer, IPC_ENDPOINTS.voice.speechChunk, { streamId: input.streamId, ...audio });
+        const send = (audio: SpeechAudio) => {
+          if (!sendToRenderer(renderer, IPC_ENDPOINTS.voice.speechChunk, { streamId: input.streamId, ...audio }))
+            controller.abort();
+        };
         try {
-          if (server.speaks()) await runCauseEffect(server.speakStream(input.text, send, controller.signal));
-          else send(await runCauseEffect(speech.speak(input)));
+          if (server.speaks())
+            return { streamed: await runCauseEffect(server.speakStream(input.text, send, controller.signal)) };
+          send(await runCauseEffect(speech.speak(input)));
+          return { streamed: false };
         } catch (error) {
           if (!controller.signal.aborted) throw error;
+          return { streamed: false };
         } finally {
-          speechStreams.finish(owner, input.streamId);
+          speechStreams.finish(owner, input.streamId, controller);
         }
       }),
       cancelSpeechStream: eventPayloadHandler(parseVoiceStream, (event, { streamId }): void =>

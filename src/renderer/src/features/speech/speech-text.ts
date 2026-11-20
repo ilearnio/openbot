@@ -9,21 +9,25 @@ const SYNTHESIS_SHARE = 0.8;
 export class SpeechParts {
   readonly #sentences: string[];
   readonly #growth: number;
+  readonly #streamed: boolean;
   #last: string | undefined;
 
-  constructor(text: string, locale: string, speed = 1) {
+  constructor(text: string, locale: string, speed = 1, streamed = false) {
     const segmenter = new Intl.Segmenter(locale, { granularity: "sentence" });
     this.#sentences = Array.from(segmenter.segment(text), ({ segment }) => segment.trim()).filter(Boolean);
     this.#growth = PART_GROWTH / Math.max(1, speed);
+    this.#streamed = streamed;
   }
 
   next(budget = Number.POSITIVE_INFINITY): string | undefined {
     const last = this.#last;
     const first = last === undefined;
-    const length = first
-      ? FIRST_PART_LENGTH
-      : Math.min(PART_LENGTH, Math.max(FIRST_PART_LENGTH, Math.floor(last.length * this.#growth)));
-    const limit = Math.min(length, budget);
+    const length = this.#streamed
+      ? SPEECH_LIMITS.maximumTextLength
+      : first
+        ? FIRST_PART_LENGTH
+        : Math.min(PART_LENGTH, Math.max(FIRST_PART_LENGTH, Math.floor(last.length * this.#growth)));
+    const limit = this.#streamed ? length : Math.min(length, budget);
     let part = "";
     for (let sentence = this.#sentences[0]; sentence !== undefined; sentence = this.#sentences[0]) {
       const piece = sentence.length > length ? firstPiece(sentence, length) : sentence;
@@ -35,7 +39,7 @@ export class SpeechParts {
         break;
       }
       this.#sentences.shift();
-      if (part.length >= limit || (first && part.length >= FIRST_PART_MINIMUM)) break;
+      if (part.length >= limit || (first && !this.#streamed && part.length >= FIRST_PART_MINIMUM)) break;
     }
     if (!part) return undefined;
     this.#last = part;

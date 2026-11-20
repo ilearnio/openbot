@@ -1,4 +1,5 @@
 import type { WebContents } from "electron";
+import { onOwnerGone } from "./owner-lifetime";
 
 export class OwnedSpeechStreams {
   readonly #streams = new WeakMap<WebContents, Map<string, AbortController>>();
@@ -11,8 +12,9 @@ export class OwnedSpeechStreams {
     return controller;
   }
 
-  finish(owner: WebContents, streamId: string): void {
-    this.#streams.get(owner)?.delete(streamId);
+  finish(owner: WebContents, streamId: string, controller: AbortController): void {
+    const streams = this.#streams.get(owner);
+    if (streams?.get(streamId) === controller) streams.delete(streamId);
   }
 
   cancel(owner: WebContents, streamId: string): void {
@@ -22,14 +24,9 @@ export class OwnedSpeechStreams {
   #watch(owner: WebContents): Map<string, AbortController> {
     const streams = new Map<string, AbortController>();
     this.#streams.set(owner, streams);
-    const cancelAll = () => {
+    onOwnerGone(owner, () => {
       for (const controller of streams.values()) controller.abort();
       streams.clear();
-    };
-    owner.once("destroyed", cancelAll);
-    owner.on("render-process-gone", cancelAll);
-    owner.on("did-start-navigation", (details) => {
-      if (details.isMainFrame && !details.isSameDocument) cancelAll();
     });
     return streams;
   }

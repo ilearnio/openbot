@@ -27,7 +27,11 @@ const SPEECH_SAMPLES = 6_000;
 const STREAM_SAMPLES = 24_000;
 const STREAM_TEXT = "Streamed speech plays as it arrives.";
 const WAV_ONLY_TEXT = "This server sends only WAV files.";
+const UNTYPED_WAV_TEXT = "This server sends a WAV file with no audio type.";
 const SLOW_TEXT = "This stream is cancelled.";
+const LONG_REPLY =
+  "A streamed reply does not need a short first part. The server starts to speak at once. " +
+  "So OpenBot sends the whole reply in one request. The voice keeps its flow from one sentence to the next.";
 const SLOW_CHUNKS = 10;
 const SLOW_CHUNK_DELAY_MS = 300;
 const useLabel = new RegExp(
@@ -49,7 +53,9 @@ interface SpeechPlaybackModule {
   readAloud(
     text: string,
     language: "en",
+    source: { serverId: string; agentId: string; messageId: string },
   ): Promise<{ completed: boolean; firstAudioMs: number | null; seconds: number }>;
+  spokenReply(messageId: string): { duration: number } | undefined;
 }
 
 interface ServerRequest {
@@ -157,6 +163,10 @@ const fake = Bun.serve({
       const fields = isDynamicRecord(body) ? body : {};
       if (fields.response_format === "pcm" && fields.input === WAV_ONLY_TEXT)
         return Response.json({ error: { message: "response_format pcm is not supported" } }, { status: 400 });
+      if (fields.response_format === "pcm" && fields.input === UNTYPED_WAV_TEXT)
+        return new Response(wav(tone(SPEECH_SAMPLES, SPEECH_RATE), SPEECH_RATE), {
+          headers: { "content-type": "application/octet-stream" },
+        });
       if (fields.response_format === "pcm") {
         const slow = fields.input === SLOW_TEXT;
         const samples = tone(STREAM_SAMPLES, SPEECH_RATE);
@@ -403,6 +413,25 @@ try {
     { chunks: wavOnly, formats },
   );
 
+  const untyped = await page.evaluate(async (text) => {
+    const streamId = crypto.randomUUID();
+    const chunks: number[] = [];
+    const stop = window.openbot.voice.onSpeechChunk((chunk) => {
+      if (chunk.streamId === streamId) chunks.push(chunk.pcm.byteLength);
+    });
+    await window.openbot.voice.speakStream({ streamId, text, language: "en" });
+    stop();
+    return chunks;
+  }, UNTYPED_WAV_TEXT);
+  const untypedRequests = requests.filter(
+    (entry) => entry.path === "/v1/audio/speech" && JSON.stringify(entry.body).includes(UNTYPED_WAV_TEXT),
+  ).length;
+  check(
+    "a WAV body with no audio type is read as WAV, not played as PCM",
+    untyped.length === 1 && untyped[0] === SPEECH_SAMPLES * 2 && untypedRequests === 1,
+    { chunks: untyped, requests: untypedRequests },
+  );
+
   const cancelled = await page.evaluate(async (text) => {
     const streamId = crypto.randomUUID();
     let chunks = 0;
@@ -430,8 +459,13 @@ try {
     const timed = async (rate: number) => {
       speech.setReplyPlaybackRate(rate);
       const started = performance.now();
-      const result = await speech.readAloud(text, "en");
-      return { ...result, wallSeconds: (performance.now() - started) / 1_000 };
+      const messageId = `voice-server-smoke-${rate}`;
+      const result = await speech.readAloud(text, "en", { serverId: "smoke", agentId: "smoke", messageId });
+      return {
+        ...result,
+        wallSeconds: (performance.now() - started) / 1_000,
+        keptSeconds: speech.spokenReply(messageId)?.duration ?? null,
+      };
     };
     const normal = await timed(1);
     const fast = await timed(2);
@@ -448,9 +482,33 @@ try {
     playback.normal,
   );
   check(
+    "a finished reply keeps its 1x audio for replay",
+    playback.normal.keptSeconds !== null &&
+      Math.abs(playback.normal.keptSeconds - streamSeconds) < 0.01 &&
+      playback.fast.keptSeconds !== null &&
+      Math.abs(playback.fast.keptSeconds - streamSeconds) < 0.01,
+    { normal: playback.normal.keptSeconds, fast: playback.fast.keptSeconds },
+  );
+  check(
     "readAloud at 2x plays the same reply in about half the time",
     playback.fast.completed && playback.fast.wallSeconds < playback.normal.wallSeconds * 0.75,
     playback.fast,
+  );
+
+  const longStart = requests.length;
+  const longReply = await page.evaluate(async (text) => {
+    const playbackModule = "/src/features/speech/speech-playback.ts";
+    const speech: SpeechPlaybackModule = await import(playbackModule);
+    return speech.readAloud(text, "en", { serverId: "smoke", agentId: "smoke", messageId: "voice-server-smoke-long" });
+  }, LONG_REPLY);
+  const longInputs = requests
+    .slice(longStart)
+    .filter((entry) => entry.path === "/v1/audio/speech")
+    .map((entry) => (isDynamicRecord(entry.body) ? entry.body.input : null));
+  check(
+    "after a stream works, a reply under the length limit goes in one request",
+    longReply.completed && longInputs.length === 1 && longInputs[0] === LONG_REPLY,
+    longInputs,
   );
 
   await closeSettings(page);

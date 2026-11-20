@@ -39,6 +39,7 @@ import {
   decodeProviderDetectionSettings,
   decodeSentMessageStats,
   decodeSpeechChunk,
+  decodeSpeechStreamResult,
   decodeUpdatePreference,
   decodeUpdateStatus,
   decodeVoiceServerProbe,
@@ -114,6 +115,8 @@ const voiceServer = {
 };
 
 const valid: [string, (value: unknown) => unknown, unknown][] = [
+  ["a streamed speech result", decodeSpeechStreamResult, { streamed: true }],
+  ["a speech result that was not streamed", decodeSpeechStreamResult, { streamed: false }],
   [
     "a speech chunk",
     decodeSpeechChunk,
@@ -378,6 +381,8 @@ const valid: [string, (value: unknown) => unknown, unknown][] = [
 ];
 
 const malformed: [string, (value: unknown) => unknown, unknown][] = [
+  ["a speech stream result without a flag", decodeSpeechStreamResult, {}],
+  ["a speech stream result with a text flag", decodeSpeechStreamResult, { streamed: "yes" }],
   ["a speech chunk without a stream", decodeSpeechChunk, { pcm: new Uint8Array(2), sampleRate: 24_000 }],
   [
     "a speech chunk with an odd byte count",

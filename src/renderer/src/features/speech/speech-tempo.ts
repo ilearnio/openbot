@@ -112,6 +112,7 @@ export class TempoStretcher {
   readonly #window: Float32Array;
   readonly #correlator: Correlator;
   readonly #template: Float32Array;
+  readonly #region: Float32Array;
   #input = new Float32Array(0);
   #inputLength = 0;
   #inputOffset = 0;
@@ -133,6 +134,7 @@ export class TempoStretcher {
     this.#window = hannWindow(this.#frame);
     this.#correlator = new Correlator(this.#frame + 2 * this.#search);
     this.#template = new Float32Array(this.#hop);
+    this.#region = new Float32Array(this.#hop + 2 * this.#search);
     this.#overlap = new Float32Array(this.#hop);
   }
 
@@ -226,7 +228,7 @@ export class TempoStretcher {
     const natural = this.#previous + hop;
     for (let index = 0; index < hop; index += 1) this.#template[index] = this.#sample(natural + index);
     const low = Math.max(this.#inputOffset, nominal - search);
-    const region = new Float32Array(hop + 2 * search);
+    const region = this.#region;
     for (let index = 0; index < region.length; index += 1) region[index] = this.#sample(low + index);
     const lags = Math.min(2 * search, Math.max(0, this.#inputLength - hop - low));
     return low + this.#correlator.bestLag(this.#template, region, lags);

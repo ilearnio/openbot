@@ -49,7 +49,6 @@ interface Reading {
   finish: (() => void) | undefined;
   stopMeter: (() => void) | undefined;
   seekTo: number | undefined;
-  before: number;
   played: AudioBuffer[];
   lastPartAsked: boolean;
   askNext: (() => void) | undefined;
@@ -72,6 +71,7 @@ interface SpokenPart {
 export interface UpcomingReading {
   text: string;
   language: SpeechLanguage;
+  firstPart?: string;
   first?: Promise<SpeechAudio>;
 }
 
@@ -81,6 +81,7 @@ let reading: Reading | undefined;
 let upcoming: UpcomingReading | undefined;
 let heldAgent: SpeechAgent | undefined;
 let replyRate = 1;
+let speechStreams = false;
 const [state, setState] = createStore<{
   reading: SpeechReading | null;
   recordings: Record<string, VoiceRecordingSummary>;
@@ -229,9 +230,10 @@ export function setUpcomingReading(next: UpcomingReading | undefined): void {
 function prepareUpcoming(): void {
   const next = upcoming;
   if (!next || next.first) return;
-  const first = new SpeechParts(next.text, next.language).next();
+  const first = new SpeechParts(next.text, next.language, replyRate, speechStreams).next();
   if (first === undefined) return;
-  next.first = speechPort().voice.speak({ text: first, language: next.language });
+  next.firstPart = first;
+  next.first = streamSpeech(first, next.language, () => undefined, new Set()).then(({ audio }) => audio);
   next.first.catch(() => undefined);
 }
 
@@ -273,7 +275,7 @@ export async function readAloud(
   const calledAt = performance.now();
   const result: ReadAloudResult = { completed: false, firstAudioMs: null, seconds: 0 };
   stopSpeech();
-  const parts = new SpeechParts(text, language, replyRate);
+  const parts = new SpeechParts(text, language, replyRate, speechStreams);
   const first = parts.next();
   if (first === undefined) return result;
   const own = newReading(true, source);
@@ -293,7 +295,6 @@ export async function readAloud(
       elapsed: 0,
     };
   });
-  const voice = speechPort().voice;
   const partTexts: string[] = [];
   let deliveredSeconds = 0;
   let deliveredPart = -1;
@@ -326,29 +327,10 @@ export async function readAloud(
       () => end(own),
     );
   });
-  const stream = (part: string, index: number): Promise<SpokenPart> => {
-    const streamId = crypto.randomUUID();
-    const askedAt = performance.now();
-    const received: SpeechAudio[] = [];
-    own.streams.add(streamId);
-    const unsubscribe = voice.onSpeechChunk((chunk) => {
-      if (chunk.streamId !== streamId) return;
-      received.push(chunk);
-      order.receive(index, chunk);
-    });
-    return voice
-      .speakStream({ streamId, text: part, language })
-      .then(() => {
-        const audio = joinedAudio(received);
-        if (!audio) throw new Error("The speech stream had no audio.");
-        return { audio, synthesisMs: performance.now() - askedAt };
-      })
-      .finally(() => {
-        unsubscribe();
-        own.streams.delete(streamId);
-        order.complete(index);
-      });
-  };
+  const stream = (part: string, index: number): Promise<SpokenPart> =>
+    streamSpeech(part, language, (chunk) => order.receive(index, chunk), own.streams).finally(() =>
+      order.complete(index),
+    );
   const ask = (part: string, preparedAudio?: Promise<SpeechAudio>): Promise<SpokenPart> => {
     const index = order.add();
     partTexts[index] = part;
@@ -394,7 +376,10 @@ export async function readAloud(
     lastPart = following;
     enqueue(following, ask(following));
   };
-  const preparedFirst = prepared?.text === text && prepared.language === language ? prepared.first : undefined;
+  const preparedFirst =
+    prepared?.text === text && prepared.language === language && prepared.firstPart === first
+      ? prepared.first
+      : undefined;
   enqueue(first, ask(first, preparedFirst));
   try {
     for (;;) {
@@ -488,12 +473,11 @@ async function playSeekable(own: Reading, buffer: AudioBuffer, from: number): Pr
 
 function keepSpokenAudio(messageId: string, parts: AudioBuffer[]): void {
   const first = parts[0];
-  if (!audioContext || !first || parts.some((part) => part.sampleRate !== first.sampleRate)) return;
-  const joined = audioContext.createBuffer(
-    1,
-    parts.reduce((total, part) => total + part.length, 0),
-    first.sampleRate,
-  );
+  if (!first || parts.some((part) => part.sampleRate !== first.sampleRate)) return;
+  const joined = new AudioBuffer({
+    length: parts.reduce((total, part) => total + part.length, 0),
+    sampleRate: first.sampleRate,
+  });
   const channel = joined.getChannelData(0);
   let at = 0;
   for (const part of parts) {
@@ -530,7 +514,6 @@ function newReading(reply: boolean, agent: SpeechAgent | null = null): Reading {
     finish: undefined,
     stopMeter: undefined,
     seekTo: undefined,
-    before: 0,
     played: [],
     lastPartAsked: false,
     askNext: undefined,
@@ -541,6 +524,35 @@ function newReading(reply: boolean, agent: SpeechAgent | null = null): Reading {
   };
   reading = own;
   return own;
+}
+
+async function streamSpeech(
+  text: string,
+  language: SpeechLanguage,
+  receive: (chunk: SpeechAudio) => void,
+  active: Set<string>,
+): Promise<SpokenPart & { audio: SpeechAudio; streamed: boolean }> {
+  const voice = speechPort().voice;
+  const streamId = crypto.randomUUID();
+  const askedAt = performance.now();
+  const received: SpeechAudio[] = [];
+  active.add(streamId);
+  const unsubscribe = voice.onSpeechChunk((chunk) => {
+    if (chunk.streamId !== streamId) return;
+    received.push(chunk);
+    receive(chunk);
+  });
+  let streamed: boolean;
+  try {
+    ({ streamed } = await voice.speakStream({ streamId, text, language }));
+  } finally {
+    unsubscribe();
+    active.delete(streamId);
+  }
+  const audio = joinedAudio(received);
+  if (!audio) throw new Error("The speech stream had no audio.");
+  speechStreams = streamed;
+  return { audio, synthesisMs: performance.now() - askedAt, streamed };
 }
 
 function audioBufferOf(audio: SpeechAudio): AudioBuffer {
@@ -653,7 +665,7 @@ function startMeter(own: Reading, output: AnalyserNode): () => void {
   const timer = setInterval(() => {
     if (own.paused || own.seekTo !== undefined) return;
     const element = own.element;
-    const elapsed = own.player ? own.player.playedSeconds : element ? own.before + element.currentTime : undefined;
+    const elapsed = own.player ? own.player.playedSeconds : element?.currentTime;
     const part = own.parts.findLast((entry) => entry.at <= (elapsed ?? 0))?.text;
     own.askNext?.();
     output.getFloatTimeDomainData(samples);

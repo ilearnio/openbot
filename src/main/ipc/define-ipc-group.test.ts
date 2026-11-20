@@ -93,7 +93,7 @@ function registerVoice(
     cancelSpeechModelDownload: handler(() => SPEECH_READY),
     removeSpeechModel: handler(() => SPEECH_READY),
     speak: payloadHandler(parseSpeechInput, () => ({ pcm: new Uint8Array(2), sampleRate: 44_100 })),
-    speakStream: payloadHandler(parseSpeechStreamInput, () => undefined),
+    speakStream: payloadHandler(parseSpeechStreamInput, () => ({ streamed: true })),
     cancelSpeechStream: payloadHandler(parseVoiceStream, () => undefined),
     warmSpeech: handler(() => undefined),
     keepRecording: payloadHandler(decodeNote, () => RECORDING),

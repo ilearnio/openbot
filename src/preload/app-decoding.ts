@@ -121,6 +121,7 @@ import {
   type SpeechChunk,
   type SpeechModelStatus,
   type SpeechSettings,
+  type SpeechStreamResult,
   UPDATE_PHASES,
   type UpdatePreference,
   type UpdateStatus,
@@ -648,6 +649,11 @@ export function decodeSpeechAudio(value: unknown): SpeechAudio {
     throw new Error("Invalid speech audio.");
   }
   return { pcm, sampleRate };
+}
+
+export function decodeSpeechStreamResult(value: unknown): SpeechStreamResult {
+  const result = decodeRecord(value, "speech stream result");
+  return { streamed: requiredBoolean(result, "streamed") };
 }
 
 export function decodeSpeechChunk(value: unknown): SpeechChunk {

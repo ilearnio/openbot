@@ -240,7 +240,10 @@ export function createMockVoice(options: MockVoiceOptions, { emit, schedule }: M
       return speechStatus();
     },
     speak: async ({ text }) => mockSpeech(text),
-    speakStream: async ({ streamId, text }) => emit(chunkListeners, { streamId, ...mockSpeech(text) }),
+    speakStream: async ({ streamId, text }) => {
+      emit(chunkListeners, { streamId, ...mockSpeech(text) });
+      return { streamed: false };
+    },
     cancelSpeechStream: async () => {},
     onSpeechChunk: (listener) => {
       chunkListeners.add(listener);

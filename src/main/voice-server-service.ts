@@ -42,7 +42,9 @@ const SPEECH_BODY_LIMIT = 32 * 1024 * 1024;
 const OPENAI_PCM_SAMPLE_RATE = 24_000;
 const MINIMUM_SAMPLE_RATE = 8_000;
 const MAXIMUM_SAMPLE_RATE = 192_000;
-const PCM_CONTENT_TYPES = new Set(["audio/pcm", "audio/l16", "application/octet-stream"]);
+const PCM_CONTENT_TYPES = new Set(["audio/pcm", "audio/l16"]);
+const STREAM_REFUSED_STATUSES = new Set([400, 406, 415, 422, 501]);
+const SNIFF_BYTES = 4;
 const WAV_CONTENT_TYPES = new Set(["audio/wav", "audio/wave", "audio/x-wav"]);
 
 interface StoredVoiceServer {
@@ -73,6 +75,8 @@ class VoiceServerFailure extends Schema.TaggedError<VoiceServerFailure>()("Voice
   field: Schema.Literals(["address", "apiKey"]),
   message: Schema.String,
 }) {}
+
+class SpeechStreamUnsupported extends Schema.TaggedError<SpeechStreamUnsupported>()("SpeechStreamUnsupported", {}) {}
 
 interface VoiceServerEvents {
   settings: [settings: VoiceServerSettings | null];
@@ -158,14 +162,18 @@ export class VoiceServerService extends EventEmitter<VoiceServerEvents> {
     );
   }).bind(this);
 
-  readonly speak = Effect.fn("VoiceServer.speak")(function* (this: VoiceServerService, text: string) {
+  readonly speak = Effect.fn("VoiceServer.speak")(function* (
+    this: VoiceServerService,
+    text: string,
+    signal?: AbortSignal,
+  ) {
     const request = this.#speechRequest(text, "wav");
     if (!request) return yield* routeOff();
     return yield* exchange(
       this.#fetch,
       request.target,
       "audio/speech",
-      request.init,
+      { ...request.init, signal },
       SPEECH_TIMEOUT_MS,
       readSpeechWav,
     ).pipe(Effect.mapError(operationError));
@@ -179,11 +187,6 @@ export class VoiceServerService extends EventEmitter<VoiceServerEvents> {
   ) {
     const request = this.#speechRequest(text, "pcm");
     if (!request) return yield* routeOff();
-    let delivered = false;
-    const deliver = (audio: SpeechAudio) => {
-      delivered = true;
-      receive(audio);
-    };
     const streamed = yield* Effect.result(
       exchange(
         this.#fetch,
@@ -191,13 +194,15 @@ export class VoiceServerService extends EventEmitter<VoiceServerEvents> {
         "audio/speech",
         { ...request.init, signal },
         SPEECH_TIMEOUT_MS,
-        (response, host) => readSpeechStream(response, host, deliver),
+        (response, host) => readSpeechStream(response, host, receive),
+        (status) => (STREAM_REFUSED_STATUSES.has(status) ? new SpeechStreamUnsupported() : null),
       ),
     );
-    if (Result.isSuccess(streamed)) return;
-    if (delivered || signal.aborted) return yield* operationError(streamed.failure);
-    logger.info("The voice server did not stream speech. Asking for a WAV file instead.");
-    receive(yield* this.speak(text));
+    if (Result.isSuccess(streamed)) return streamed.success;
+    if (streamed.failure._tag === "VoiceServerFailure") return yield* operationError(streamed.failure);
+    logger.info("The voice server does not stream speech. Asking for a WAV file instead.");
+    receive(yield* this.speak(text, signal));
+    return false;
   }).bind(this);
 
   #speechRequest(text: string, format: "wav" | "pcm"): { target: ServerTarget; init: RequestInit } | null {
@@ -235,6 +240,7 @@ interface TranscriptionCaller {
 }
 
 type StatusText = (status: number) => string | null;
+type StatusRefusal<E> = (status: number) => string | NoInfer<E> | null;
 
 export function transcribeRecording(
   fetcher: typeof fetch,
@@ -290,15 +296,15 @@ function invalidAudio(host: string) {
   return new VoiceServerFailure({ field: "address", message: sourceText("error.voice.server.invalidAudio", { host }) });
 }
 
-function exchange<A>(
+function exchange<A, E = never>(
   fetcher: typeof fetch,
   target: ServerTarget,
   path: string,
   init: RequestInit,
   timeoutMs: number,
-  read: (response: Response, host: string) => Effect.Effect<A, VoiceServerFailure>,
-  refused?: StatusText,
-): Effect.Effect<A, VoiceServerFailure> {
+  read: (response: Response, host: string) => Effect.Effect<A, VoiceServerFailure | E>,
+  refused?: StatusRefusal<E>,
+): Effect.Effect<A, VoiceServerFailure | E> {
   const host = voiceServerHost(target.address);
   const fail = (field: VoiceServerProbeField, message: string) => new VoiceServerFailure({ field, message });
   return Effect.acquireUseRelease(
@@ -322,7 +328,8 @@ function exchange<A>(
           catch: () => fail("address", sourceText("error.provider.discoveryUnreachable", { host })),
         });
         const explained = response.ok ? null : (refused?.(response.status) ?? null);
-        if (explained) return yield* fail("address", explained);
+        if (typeof explained === "string") return yield* fail("address", explained);
+        if (explained) return yield* Effect.fail(explained);
         if (response.status >= 300 && response.status < 400)
           return yield* fail("address", sourceText("error.provider.discoveryRedirect", { host }));
         if (response.status === 401 || response.status === 403)
@@ -375,25 +382,72 @@ function readSpeechStream(
   response: Response,
   host: string,
   deliver: (audio: SpeechAudio) => void,
-): Effect.Effect<void, VoiceServerFailure> {
-  const format = speechStreamFormat(response.headers.get("content-type"));
-  if (format === "wav") return readSpeechWav(response, host).pipe(Effect.map(deliver));
-  if (format === null) return Effect.fail(invalidAudio(host));
+): Effect.Effect<boolean, VoiceServerFailure | SpeechStreamUnsupported> {
+  const declared = declaredSpeechFormat(response.headers.get("content-type"));
+  if (declared === "wav")
+    return readSpeechWav(response, host).pipe(
+      Effect.map((audio) => {
+        deliver(audio);
+        return false;
+      }),
+    );
+  if (declared === "other") return Effect.fail(new SpeechStreamUnsupported());
   const sampleRate = streamSampleRate(response.headers.get("x-sample-rate"));
-  let pending = new Uint8Array(0);
-  return readStreamedBody(response, SPEECH_BODY_LIMIT, bodyFailure(host), (bytes) => {
-    const joined = pending.byteLength > 0 ? concatBytes(pending, bytes) : bytes;
+  let format: SpeechBodyFormat | undefined = declared === "pcm" ? "pcm" : undefined;
+  let held = Buffer.alloc(0);
+  let delivered = 0;
+  const forward = (bytes: Uint8Array) => {
+    const joined = Buffer.concat([held, bytes]);
     const even = joined.byteLength - (joined.byteLength % 2);
-    pending = joined.slice(even);
-    if (even > 0) deliver({ pcm: joined.slice(0, even), sampleRate });
-  }).pipe(Effect.flatMap((size) => (size >= 2 ? Effect.void : Effect.fail(invalidAudio(host)))));
+    held = joined.subarray(even);
+    if (even === 0) return;
+    delivered += even;
+    deliver({ pcm: new Uint8Array(joined.subarray(0, even)), sampleRate });
+  };
+  return readStreamedBody(response, SPEECH_BODY_LIMIT, bodyFailure(host), (bytes) => {
+    if (format === "pcm") return forward(bytes);
+    held = Buffer.concat([held, bytes]);
+    if (format === undefined && held.byteLength >= SNIFF_BYTES) format = sniffSpeechFormat(held);
+    if (format !== "pcm") return;
+    const start = held;
+    held = Buffer.alloc(0);
+    forward(start);
+  }).pipe(
+    Effect.flatMap((): Effect.Effect<boolean, VoiceServerFailure | SpeechStreamUnsupported> => {
+      if (format === "wav") {
+        const audio = decodeVoiceServerWav(held);
+        if (!audio) return Effect.fail(invalidAudio(host));
+        deliver(audio);
+        return Effect.succeed(false);
+      }
+      if (format === "other") return Effect.fail(new SpeechStreamUnsupported());
+      if (format === undefined) forward(Buffer.alloc(0));
+      return delivered > 0 ? Effect.succeed(true) : Effect.fail(invalidAudio(host));
+    }),
+  );
 }
 
-function speechStreamFormat(contentType: string | null): "pcm" | "wav" | null {
+type SpeechBodyFormat = "pcm" | "wav" | "other";
+
+function declaredSpeechFormat(contentType: string | null): SpeechBodyFormat | "unknown" {
   const type = (contentType ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
-  if (type === "" || PCM_CONTENT_TYPES.has(type)) return "pcm";
+  if (PCM_CONTENT_TYPES.has(type)) return "pcm";
   if (WAV_CONTENT_TYPES.has(type)) return "wav";
-  return null;
+  if (type === "" || type === "application/octet-stream") return "unknown";
+  return "other";
+}
+
+function sniffSpeechFormat(head: Buffer): SpeechBodyFormat {
+  const tag = head.toString("latin1", 0, 4);
+  if (tag === "RIFF") return "wav";
+  if (
+    tag.startsWith("ID3") ||
+    tag === "OggS" ||
+    tag === "fLaC" ||
+    (head[0] === 0xff && ((head[1] ?? 0) & 0xe0) === 0xe0)
+  )
+    return "other";
+  return "pcm";
 }
 
 function streamSampleRate(header: string | null): number {
@@ -401,13 +455,6 @@ function streamSampleRate(header: string | null): number {
   return Number.isInteger(rate) && rate >= MINIMUM_SAMPLE_RATE && rate <= MAXIMUM_SAMPLE_RATE
     ? rate
     : OPENAI_PCM_SAMPLE_RATE;
-}
-
-function concatBytes(first: Uint8Array, second: Uint8Array): Uint8Array {
-  const joined = new Uint8Array(first.byteLength + second.byteLength);
-  joined.set(first);
-  joined.set(second, first.byteLength);
-  return joined;
 }
 
 function readJson(response: Response, host: string, limit: number): Effect.Effect<unknown, VoiceServerFailure> {
