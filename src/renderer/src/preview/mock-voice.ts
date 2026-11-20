@@ -7,6 +7,8 @@ import {
   isLocalVoiceModelId,
   type OpenBotDesktopApi,
   SPEECH_MODEL_ID,
+  type SpeechAudio,
+  type SpeechChunk,
   type SpeechKeyProvider,
   type SpeechModelStatus,
   type SpeechSettings,
@@ -77,6 +79,7 @@ export function createMockVoice(options: MockVoiceOptions, { emit, schedule }: M
   let server: VoiceServerSettings | null = clone(options.voiceServer ?? null);
   const serverListeners = new Set<Listener<VoiceServerSettings | null>>();
   const liveListeners = new Set<Listener<VoiceLiveEvent>>();
+  const chunkListeners = new Set<Listener<SpeechChunk>>();
   const liveAnswerers = new Map<string, RTCPeerConnection>();
   let xaiKeySaved = options.xaiKeySaved ?? false;
   const keySaved = (provider: SpeechKeyProvider) =>
@@ -236,10 +239,13 @@ export function createMockVoice(options: MockVoiceOptions, { emit, schedule }: M
       setSpeechStatus({ modelId: SPEECH_MODEL_ID, phase: "missing", progress: null, message: null });
       return speechStatus();
     },
-    speak: async ({ text }) => ({
-      pcm: new Uint8Array(Math.min(10, Math.max(0.5, text.length / 15)) * MOCK_SPEECH_SAMPLE_RATE * 2),
-      sampleRate: MOCK_SPEECH_SAMPLE_RATE,
-    }),
+    speak: async ({ text }) => mockSpeech(text),
+    speakStream: async ({ streamId, text }) => emit(chunkListeners, { streamId, ...mockSpeech(text) }),
+    cancelSpeechStream: async () => {},
+    onSpeechChunk: (listener) => {
+      chunkListeners.add(listener);
+      return () => chunkListeners.delete(listener);
+    },
     warmSpeech: async () => undefined,
     keepRecording: async ({ audio }) => ({
       id: `mock-voice-recording-${audio.byteLength}`,
@@ -300,4 +306,11 @@ export function createMockVoice(options: MockVoiceOptions, { emit, schedule }: M
     },
   };
   return { voice };
+}
+
+function mockSpeech(text: string): SpeechAudio {
+  return {
+    pcm: new Uint8Array(Math.min(10, Math.max(0.5, text.length / 15)) * MOCK_SPEECH_SAMPLE_RATE * 2),
+    sampleRate: MOCK_SPEECH_SAMPLE_RATE,
+  };
 }

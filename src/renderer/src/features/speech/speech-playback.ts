@@ -1,6 +1,8 @@
 import type { SpeechAudio, SpeechLanguage } from "@openbot/contracts/ipc";
 import { createStore } from "solid-js";
 import { speechPort } from "./speech-port";
+import { SpeechStreamOrder } from "./speech-stream-order";
+import { pcm16Samples, SpeechStreamPlayer } from "./speech-stream-player";
 import { partBudget, SpeechParts } from "./speech-text";
 
 export const SPEECH_LEVEL_COUNT = 40;
@@ -51,6 +53,15 @@ interface Reading {
   played: AudioBuffer[];
   lastPartAsked: boolean;
   askNext: (() => void) | undefined;
+  player: SpeechStreamPlayer | undefined;
+  streams: Set<string>;
+  parts: ReadingPart[];
+  wake: (() => void) | undefined;
+}
+
+interface ReadingPart {
+  at: number;
+  text: string;
 }
 
 interface SpokenPart {
@@ -146,7 +157,9 @@ function recordingPeaks(buffer: AudioBuffer): number[] {
 
 export function setReplyPlaybackRate(rate: number): void {
   replyRate = rate;
-  if (reading?.reply && reading.element) setRate(reading.element, rate);
+  if (!reading?.reply) return;
+  if (reading.element) setRate(reading.element, rate);
+  reading.player?.setTempo(rate);
 }
 
 function setRate(element: HTMLAudioElement, rate: number): void {
@@ -158,6 +171,7 @@ export function pauseSpeech(): void {
   if (!reading || reading.paused) return;
   reading.paused = true;
   reading.element?.pause();
+  reading.player?.pause();
   setState((draft) => {
     if (draft.reading) draft.reading.paused = true;
   });
@@ -168,6 +182,7 @@ export function resumeSpeech(): void {
   if (!own?.paused) return;
   own.paused = false;
   if (own.element) startElement(own, own.element);
+  own.player?.resume();
   own.askNext?.();
   setState((draft) => {
     if (draft.reading) draft.reading.paused = false;
@@ -229,6 +244,13 @@ function end(own: Reading): void {
   own.stopped = true;
   own.finish?.();
   own.stopMeter?.();
+  own.player?.stop();
+  for (const streamId of own.streams)
+    void speechPort()
+      .voice.cancelSpeechStream({ streamId })
+      .catch(() => undefined);
+  own.streams.clear();
+  own.wake?.();
   if (reading !== own) return;
   reading = undefined;
   setState((draft) => {
@@ -272,13 +294,75 @@ export async function readAloud(
     };
   });
   const voice = speechPort().voice;
-  const preparedFirst = prepared?.text === text && prepared.language === language ? prepared.first : undefined;
-  const ask = (part: string): Promise<SpokenPart> => {
+  const partTexts: string[] = [];
+  let deliveredSeconds = 0;
+  let deliveredPart = -1;
+  let waiting: SpeechAudio[] | undefined;
+  const append = (audio: SpeechAudio, player: SpeechStreamPlayer) => {
+    player.append(audio.pcm, audio.sampleRate);
+    result.firstAudioMs ??= Math.round(performance.now() - calledAt);
+  };
+  const order = new SpeechStreamOrder((audio, part) => {
+    if (own.stopped) return;
+    if (part !== deliveredPart) {
+      deliveredPart = part;
+      own.parts.push({ at: deliveredSeconds, text: partTexts[part] ?? "" });
+    }
+    deliveredSeconds += audio.pcm.byteLength / 2 / audio.sampleRate;
+    if (own.player) return append(audio, own.player);
+    if (waiting) return waiting.push(audio);
+    waiting = [audio];
+    void SpeechStreamPlayer.start(audio.sampleRate, own.reply ? replyRate : 1).then(
+      (player) => {
+        if (own.stopped) return player.stop();
+        own.player = player;
+        if (own.paused) player.pause();
+        own.stopMeter ??= startMeter(own, player.output);
+        for (const queued of waiting ?? []) append(queued, player);
+        waiting = undefined;
+        if (own.lastPartAsked && own.streams.size === 0) player.end();
+        own.wake?.();
+      },
+      () => end(own),
+    );
+  });
+  const stream = (part: string, index: number): Promise<SpokenPart> => {
+    const streamId = crypto.randomUUID();
     const askedAt = performance.now();
-    return voice.speak({ text: part, language }).then((audio) => ({ audio, synthesisMs: performance.now() - askedAt }));
+    const received: SpeechAudio[] = [];
+    own.streams.add(streamId);
+    const unsubscribe = voice.onSpeechChunk((chunk) => {
+      if (chunk.streamId !== streamId) return;
+      received.push(chunk);
+      order.receive(index, chunk);
+    });
+    return voice
+      .speakStream({ streamId, text: part, language })
+      .then(() => {
+        const audio = joinedAudio(received);
+        if (!audio) throw new Error("The speech stream had no audio.");
+        return { audio, synthesisMs: performance.now() - askedAt };
+      })
+      .finally(() => {
+        unsubscribe();
+        own.streams.delete(streamId);
+        order.complete(index);
+      });
+  };
+  const ask = (part: string, preparedAudio?: Promise<SpeechAudio>): Promise<SpokenPart> => {
+    const index = order.add();
+    partTexts[index] = part;
+    if (!preparedAudio) return stream(part, index);
+    return preparedAudio.then(
+      (audio) => {
+        order.receive(index, audio);
+        order.complete(index);
+        return { audio, synthesisMs: undefined };
+      },
+      () => stream(part, index),
+    );
   };
   const queue: Promise<SpokenPart & { text: string; seconds: number }>[] = [];
-  let ahead = 0;
   let asking = false;
   let lastPart = first;
   let lastSynthesisMs: number | undefined;
@@ -286,7 +370,6 @@ export async function readAloud(
     asking = true;
     const ready = spoken.then((answer) => {
       const seconds = answer.audio.pcm.byteLength / 2 / answer.audio.sampleRate;
-      ahead += seconds;
       asking = false;
       lastSynthesisMs = answer.synthesisMs;
       own.askNext?.();
@@ -294,45 +377,48 @@ export async function readAloud(
     });
     ready.catch(() => undefined);
     queue.push(ready);
+    own.wake?.();
   };
-  const askNext = (playing = 0) => {
-    if (own.stopped || own.paused || own.lastPartAsked || asking || ahead >= SYNTHESIS_AHEAD_SECONDS) return;
+  own.askNext = () => {
+    const buffered = own.player?.bufferedSeconds ?? 0;
+    if (own.stopped || own.paused || own.lastPartAsked || asking || buffered >= SYNTHESIS_AHEAD_SECONDS) return;
     const budget =
-      lastSynthesisMs === undefined ? undefined : partBudget(lastPart, ahead + playing, lastSynthesisMs, replyRate);
+      lastSynthesisMs === undefined ? undefined : partBudget(lastPart, buffered, lastSynthesisMs, replyRate);
     const following = parts.next(budget);
     if (following === undefined) {
       own.lastPartAsked = true;
       prepareUpcoming();
+      own.wake?.();
       return;
     }
     lastPart = following;
     enqueue(following, ask(following));
   };
-  own.askNext = () => {
-    const element = own.element;
-    askNext(element ? element.duration - element.currentTime || 0 : 0);
-  };
-  enqueue(
-    first,
-    preparedFirst
-      ? preparedFirst.then((audio) => ({ audio, synthesisMs: undefined })).catch(() => ask(first))
-      : ask(first),
-  );
+  const preparedFirst = prepared?.text === text && prepared.language === language ? prepared.first : undefined;
+  enqueue(first, ask(first, preparedFirst));
   try {
-    for (let next = queue.shift(); next; next = queue.shift()) {
-      const { audio, text: current, seconds } = await next;
-      if (own.stopped) return result;
-      ahead -= seconds;
-      askNext(seconds);
-      setState((draft) => {
-        if (!draft.reading) return;
-        draft.reading.part = current;
+    for (;;) {
+      const next = queue.shift();
+      if (next) {
+        const { audio, seconds } = await next;
+        if (own.stopped) return result;
+        result.seconds += seconds;
+        own.played.push(audioBufferOf(audio));
+        continue;
+      }
+      if (own.lastPartAsked) break;
+      await new Promise<void>((resolve) => {
+        own.wake = resolve;
       });
-      result.firstAudioMs ??= Math.round(performance.now() - calledAt);
-      result.seconds += seconds;
-      await play(own, audio);
       if (own.stopped) return result;
     }
+    own.player?.end();
+    while (!own.player && !own.stopped)
+      await new Promise<void>((resolve) => {
+        own.wake = resolve;
+      });
+    await own.player?.finished;
+    if (own.stopped) return result;
     const messageId = source?.messageId;
     if (messageId) keepSpokenAudio(messageId, own.played);
     result.completed = true;
@@ -448,22 +534,32 @@ function newReading(reply: boolean, agent: SpeechAgent | null = null): Reading {
     played: [],
     lastPartAsked: false,
     askNext: undefined,
+    player: undefined,
+    streams: new Set(),
+    parts: [],
+    wake: undefined,
   };
   reading = own;
   return own;
 }
 
-async function play(own: Reading, audio: SpeechAudio): Promise<void> {
-  audioContext ??= new AudioContext();
-  const length = audio.pcm.byteLength / 2;
-  const buffer = audioContext.createBuffer(1, length, audio.sampleRate);
-  const channel = buffer.getChannelData(0);
-  const view = new DataView(audio.pcm.buffer, audio.pcm.byteOffset, audio.pcm.byteLength);
-  for (let index = 0; index < length; index += 1) channel[index] = view.getInt16(index * 2, true) / 32_768;
-  await playBuffer(own, buffer);
-  if (own.stopped) return;
-  own.before += buffer.duration;
-  own.played.push(buffer);
+function audioBufferOf(audio: SpeechAudio): AudioBuffer {
+  const samples = pcm16Samples(audio.pcm);
+  const buffer = new AudioBuffer({ length: Math.max(1, samples.length), sampleRate: audio.sampleRate });
+  buffer.copyToChannel(samples, 0);
+  return buffer;
+}
+
+function joinedAudio(chunks: readonly SpeechAudio[]): SpeechAudio | undefined {
+  const first = chunks[0];
+  if (!first) return undefined;
+  const pcm = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.pcm.byteLength, 0));
+  let at = 0;
+  for (const chunk of chunks) {
+    pcm.set(chunk.pcm, at);
+    at += chunk.pcm.byteLength;
+  }
+  return { pcm, sampleRate: first.sampleRate };
 }
 
 async function playBuffer(own: Reading, buffer: AudioBuffer, offset = 0): Promise<void> {
@@ -557,7 +653,9 @@ function startMeter(own: Reading, output: AnalyserNode): () => void {
   const timer = setInterval(() => {
     if (own.paused || own.seekTo !== undefined) return;
     const element = own.element;
-    const elapsed = element ? own.before + element.currentTime : undefined;
+    const elapsed = own.player ? own.player.playedSeconds : element ? own.before + element.currentTime : undefined;
+    const part = own.parts.findLast((entry) => entry.at <= (elapsed ?? 0))?.text;
+    own.askNext?.();
     output.getFloatTimeDomainData(samples);
     let sum = 0;
     for (const sample of samples) sum += sample * sample;
@@ -567,6 +665,7 @@ function startMeter(own: Reading, output: AnalyserNode): () => void {
     setState((draft) => {
       if (!draft.reading) return;
       draft.reading.levels = [...draft.reading.levels.slice(1), value];
+      if (part !== undefined) draft.reading.part = part;
       if (elapsed !== undefined) draft.reading.elapsed = Math.min(elapsed, draft.reading.duration ?? elapsed);
     });
   }, SPEECH_LEVEL_INTERVAL_MS);

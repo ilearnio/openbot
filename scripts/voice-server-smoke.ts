@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { OpenBotDesktopApi, VoiceServerSettings } from "@openbot/contracts/ipc";
+import { isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { translateFor } from "@openbot/i18n";
 import { createOpenBotLogger } from "@openbot/logging";
 import type { Page } from "playwright-core";
@@ -23,6 +24,12 @@ const VOICES = ["af_heart", "am_adam"];
 const TRANSCRIPT = "Voice server smoke transcript";
 const SPEECH_RATE = 24_000;
 const SPEECH_SAMPLES = 6_000;
+const STREAM_SAMPLES = 24_000;
+const STREAM_TEXT = "Streamed speech plays as it arrives.";
+const WAV_ONLY_TEXT = "This server sends only WAV files.";
+const SLOW_TEXT = "This stream is cancelled.";
+const SLOW_CHUNKS = 10;
+const SLOW_CHUNK_DELAY_MS = 300;
 const useLabel = new RegExp(
   `^${t("settings.voice.model.useLabel", { name: "\u0000" })
     .split("\u0000")
@@ -35,6 +42,14 @@ interface Check {
   name: string;
   passed: boolean;
   detail: unknown;
+}
+
+interface SpeechPlaybackModule {
+  setReplyPlaybackRate(rate: number): void;
+  readAloud(
+    text: string,
+    language: "en",
+  ): Promise<{ completed: boolean; firstAudioMs: number | null; seconds: number }>;
 }
 
 interface ServerRequest {
@@ -83,6 +98,26 @@ function tone(count: number, sampleRate: number): Int16Array {
   return samples;
 }
 
+function pcmStream(samples: Int16Array, cuts: number[], delayMs: number): ReadableStream<Uint8Array> {
+  const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
+  const edges = [0, ...cuts, bytes.byteLength];
+  let next = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      const start = edges[next];
+      const end = edges[next + 1];
+      if (start === undefined || end === undefined) return controller.close();
+      next += 1;
+      if (next > 1 && delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      controller.enqueue(bytes.slice(start, end));
+    },
+  });
+}
+
+function evenCuts(total: number, count: number): number[] {
+  return Array.from({ length: count - 1 }, (_, index) => Math.round(((index + 1) * total) / count / 2) * 2);
+}
+
 const requests: ServerRequest[] = [];
 const fake = Bun.serve({
   hostname: "127.0.0.1",
@@ -117,7 +152,19 @@ const fake = Bun.serve({
       return Response.json({ text: ` ${TRANSCRIPT} ` });
     }
     if (request.method === "POST" && url.pathname === "/v1/audio/speech") {
-      entry.body = await request.json();
+      const body = await request.json();
+      entry.body = body;
+      const fields = isDynamicRecord(body) ? body : {};
+      if (fields.response_format === "pcm" && fields.input === WAV_ONLY_TEXT)
+        return Response.json({ error: { message: "response_format pcm is not supported" } }, { status: 400 });
+      if (fields.response_format === "pcm") {
+        const slow = fields.input === SLOW_TEXT;
+        const samples = tone(STREAM_SAMPLES, SPEECH_RATE);
+        const cuts = slow ? evenCuts(samples.byteLength, SLOW_CHUNKS) : [4_801, 9_600, 30_001];
+        return new Response(pcmStream(samples, cuts, slow ? SLOW_CHUNK_DELAY_MS : 20), {
+          headers: { "content-type": "audio/pcm", "x-sample-rate": String(SPEECH_RATE) },
+        });
+      }
       return new Response(wav(tone(SPEECH_SAMPLES, SPEECH_RATE), SPEECH_RATE), {
         headers: { "content-type": "audio/wav" },
       });
@@ -308,6 +355,102 @@ try {
           response_format: "wav",
         }),
     speechRequest,
+  );
+
+  const streamed = await page.evaluate(async (text) => {
+    const streamId = crypto.randomUUID();
+    const chunks: { bytes: number; sampleRate: number; beforeEnd: boolean }[] = [];
+    let ended = false;
+    const stop = window.openbot.voice.onSpeechChunk((chunk) => {
+      if (chunk.streamId === streamId)
+        chunks.push({ bytes: chunk.pcm.byteLength, sampleRate: chunk.sampleRate, beforeEnd: !ended });
+    });
+    await window.openbot.voice.speakStream({ streamId, text, language: "en" });
+    ended = true;
+    stop();
+    return chunks;
+  }, STREAM_TEXT);
+  check(
+    "speakStream delivers the streamed PCM in even chunks before the request ends",
+    streamed.length >= 2 &&
+      streamed.every((chunk) => chunk.bytes % 2 === 0 && chunk.sampleRate === SPEECH_RATE && chunk.beforeEnd) &&
+      streamed.reduce((total, chunk) => total + chunk.bytes, 0) === STREAM_SAMPLES * 2,
+    streamed,
+  );
+  check(
+    "speakStream asks the server for PCM",
+    JSON.stringify(lastRequest("/v1/audio/speech")?.body) ===
+      JSON.stringify({ model: SPEECH_MODEL, input: STREAM_TEXT, voice: VOICES[0], response_format: "pcm" }),
+    lastRequest("/v1/audio/speech"),
+  );
+
+  const wavOnly = await page.evaluate(async (text) => {
+    const streamId = crypto.randomUUID();
+    const chunks: number[] = [];
+    const stop = window.openbot.voice.onSpeechChunk((chunk) => {
+      if (chunk.streamId === streamId) chunks.push(chunk.pcm.byteLength);
+    });
+    await window.openbot.voice.speakStream({ streamId, text, language: "en" });
+    stop();
+    return chunks;
+  }, WAV_ONLY_TEXT);
+  const formats = requests
+    .filter((entry) => entry.path === "/v1/audio/speech" && JSON.stringify(entry.body).includes(WAV_ONLY_TEXT))
+    .map((entry) => (JSON.stringify(entry.body).includes('"pcm"') ? "pcm" : "wav"));
+  check(
+    "a server that refuses PCM gets a WAV request, delivered as one chunk",
+    wavOnly.length === 1 && wavOnly[0] === SPEECH_SAMPLES * 2 && JSON.stringify(formats) === '["pcm","wav"]',
+    { chunks: wavOnly, formats },
+  );
+
+  const cancelled = await page.evaluate(async (text) => {
+    const streamId = crypto.randomUUID();
+    let chunks = 0;
+    const stop = window.openbot.voice.onSpeechChunk((chunk) => {
+      if (chunk.streamId !== streamId) return;
+      chunks += 1;
+      if (chunks === 1) void window.openbot.voice.cancelSpeechStream({ streamId });
+    });
+    const outcome = await window.openbot.voice
+      .speakStream({ streamId, text, language: "en" })
+      .then(() => "resolved")
+      .catch((error: unknown) => String(error));
+    stop();
+    return { outcome, chunks };
+  }, SLOW_TEXT);
+  check(
+    "cancelSpeechStream stops a stream early without an error",
+    cancelled.outcome === "resolved" && cancelled.chunks < SLOW_CHUNKS,
+    cancelled,
+  );
+
+  const playback = await page.evaluate(async (text) => {
+    const playbackModule = "/src/features/speech/speech-playback.ts";
+    const speech: SpeechPlaybackModule = await import(playbackModule);
+    const timed = async (rate: number) => {
+      speech.setReplyPlaybackRate(rate);
+      const started = performance.now();
+      const result = await speech.readAloud(text, "en");
+      return { ...result, wallSeconds: (performance.now() - started) / 1_000 };
+    };
+    const normal = await timed(1);
+    const fast = await timed(2);
+    speech.setReplyPlaybackRate(1);
+    return { normal, fast };
+  }, STREAM_TEXT);
+  const streamSeconds = STREAM_SAMPLES / SPEECH_RATE;
+  check(
+    "readAloud plays a streamed reply to the end and starts before the stream ends",
+    playback.normal.completed &&
+      playback.normal.firstAudioMs !== null &&
+      Math.abs(playback.normal.seconds - streamSeconds) < 0.01 &&
+      playback.normal.wallSeconds >= streamSeconds * 0.9,
+    playback.normal,
+  );
+  check(
+    "readAloud at 2x plays the same reply in about half the time",
+    playback.fast.completed && playback.fast.wallSeconds < playback.normal.wallSeconds * 0.75,
+    playback.fast,
   );
 
   await closeSettings(page);

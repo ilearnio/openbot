@@ -549,6 +549,10 @@ export interface SpeechAudio {
   sampleRate: number;
 }
 
+export interface SpeechStreamInput extends SpeechInput, VoiceStream {}
+
+export interface SpeechChunk extends SpeechAudio, VoiceStream {}
+
 export function isSpeechVoice(value: unknown): value is SpeechVoice {
   return isOneOf(SPEECH_VOICES, value);
 }

@@ -118,6 +118,7 @@ import {
   type RemoteSessionReusePreference,
   type SentMessageStats,
   type SpeechAudio,
+  type SpeechChunk,
   type SpeechModelStatus,
   type SpeechSettings,
   UPDATE_PHASES,
@@ -647,6 +648,11 @@ export function decodeSpeechAudio(value: unknown): SpeechAudio {
     throw new Error("Invalid speech audio.");
   }
   return { pcm, sampleRate };
+}
+
+export function decodeSpeechChunk(value: unknown): SpeechChunk {
+  const chunk = decodeRecord(value, "speech chunk");
+  return { streamId: requiredString(chunk, "streamId"), ...decodeSpeechAudio(chunk) };
 }
 
 export function decodeVoiceServerSettings(value: unknown): VoiceServerSettings | null {

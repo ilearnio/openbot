@@ -16,6 +16,7 @@ import {
   type SpeechApiKeyInput,
   type SpeechInput,
   type SpeechSettings,
+  type SpeechStreamInput,
   VOICE_API_KEY_MAX_LENGTH,
   VOICE_AUDIO_LIMITS,
   VOICE_LIVE_LIMITS,
@@ -174,6 +175,10 @@ export function parseSpeechInput(input: unknown): SpeechInput {
     throw new Error("Speech needs text and a known language.");
   if (input.text.length > SPEECH_LIMITS.maximumTextLength) throw new Error("The speech text is too long.");
   return { text: input.text, language: input.language };
+}
+
+export function parseSpeechStreamInput(input: unknown): SpeechStreamInput {
+  return { ...parseSpeechInput(input), ...parseVoiceStream(input) };
 }
 
 export function parseVoiceServerConnection(input: unknown): VoiceServerConnection {

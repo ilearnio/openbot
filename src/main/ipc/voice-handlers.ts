@@ -12,6 +12,7 @@ import type {
   VoiceStream,
   VoiceTranscriptionResult,
 } from "@openbot/contracts/ipc";
+import { IPC_ENDPOINTS } from "@openbot/contracts/ipc";
 import {
   decodeLiveVoiceSessionResponse,
   isLiveVoiceName,
@@ -25,6 +26,7 @@ import { runCauseEffect } from "../../backend/effect-boundary";
 import { liveVoiceOf } from "../live-voice-choice";
 import { acceptEmpty } from "../remote-host-decoding";
 import type { RemoteServerManager } from "../remote-server-manager";
+import { sendToRenderer } from "../renderer-ipc";
 import { voiceLiveEventFromWire } from "../team-api/route-live-voice";
 import type { VoiceServerService } from "../voice-server-service";
 import type { VoiceSpeechService } from "../voice-speech-service";
@@ -32,10 +34,12 @@ import type { VoiceTranscriptionService } from "../voice-transcription-service";
 import { agentRequest } from "./agent-inputs";
 import { eventPayloadHandler, handler, type IpcGroupHandlers, payloadHandler } from "./define-ipc-group";
 import { routeToServer } from "./route-to-server";
+import { OwnedSpeechStreams } from "./speech-streams";
 import {
   parseSpeechApiKey,
   parseSpeechInput,
   parseSpeechSettings,
+  parseSpeechStreamInput,
   parseVoiceApiKey,
   parseVoiceLiveStart,
   parseVoiceLiveStop,
@@ -99,6 +103,7 @@ export function voiceIpcHandlers({
     for (const sessionId of sessions) void stopLive(sessionId).catch(() => undefined);
     sessions.clear();
   };
+  const speechStreams = new OwnedSpeechStreams();
   const watchLiveOwner = (owner: WebContents, sessionId: string) => {
     const sessions = liveSessions.get(owner);
     if (sessions) {
@@ -181,6 +186,24 @@ export function voiceIpcHandlers({
         parseSpeechInput,
         (input): Promise<SpeechAudio> =>
           runCauseEffect(server.speaks() ? server.speak(input.text) : speech.speak(input)),
+      ),
+      speakStream: eventPayloadHandler(parseSpeechStreamInput, async (event, input): Promise<void> => {
+        const owner = event.sender;
+        const controller = speechStreams.start(owner, input.streamId);
+        const renderer = { isDestroyed: () => owner.isDestroyed(), webContents: owner };
+        const send = (audio: SpeechAudio) =>
+          sendToRenderer(renderer, IPC_ENDPOINTS.voice.speechChunk, { streamId: input.streamId, ...audio });
+        try {
+          if (server.speaks()) await runCauseEffect(server.speakStream(input.text, send, controller.signal));
+          else send(await runCauseEffect(speech.speak(input)));
+        } catch (error) {
+          if (!controller.signal.aborted) throw error;
+        } finally {
+          speechStreams.finish(owner, input.streamId);
+        }
+      }),
+      cancelSpeechStream: eventPayloadHandler(parseVoiceStream, (event, { streamId }): void =>
+        speechStreams.cancel(event.sender, streamId),
       ),
       warmSpeech: handler((): Promise<void> => (server.speaks() ? Promise.resolve() : runCauseEffect(speech.warm()))),
       keepRecording: payloadHandler(parseVoiceRecording, async ({ audio }): Promise<DraftAttachment> => {

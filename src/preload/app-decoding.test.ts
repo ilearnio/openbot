@@ -38,6 +38,7 @@ import {
   decodePendingMarketplaceListing,
   decodeProviderDetectionSettings,
   decodeSentMessageStats,
+  decodeSpeechChunk,
   decodeUpdatePreference,
   decodeUpdateStatus,
   decodeVoiceServerProbe,
@@ -113,6 +114,11 @@ const voiceServer = {
 };
 
 const valid: [string, (value: unknown) => unknown, unknown][] = [
+  [
+    "a speech chunk",
+    decodeSpeechChunk,
+    { streamId: "speech-1", pcm: new Uint8Array([1, 0, 255, 127]), sampleRate: 24_000 },
+  ],
   [
     "app behavior with a quit guard",
     decodeAppBehaviorPreference,
@@ -372,6 +378,14 @@ const valid: [string, (value: unknown) => unknown, unknown][] = [
 ];
 
 const malformed: [string, (value: unknown) => unknown, unknown][] = [
+  ["a speech chunk without a stream", decodeSpeechChunk, { pcm: new Uint8Array(2), sampleRate: 24_000 }],
+  [
+    "a speech chunk with an odd byte count",
+    decodeSpeechChunk,
+    { streamId: "speech-1", pcm: new Uint8Array(3), sampleRate: 24_000 },
+  ],
+  ["a speech chunk without a sample rate", decodeSpeechChunk, { streamId: "speech-1", pcm: new Uint8Array(2) }],
+  ["a speech chunk with text audio", decodeSpeechChunk, { streamId: "speech-1", pcm: "AAAA", sampleRate: 24_000 }],
   [
     "an unknown quit guard",
     decodeAppBehaviorPreference,
